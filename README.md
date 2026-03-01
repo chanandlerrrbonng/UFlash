@@ -12,7 +12,7 @@
 - Kotlin 1.9+
 
 ### Install from Pre-built APK (Recommended)
-1. Download the latest APK from [Releases](https://github.com/<your-repo>/uflash/releases)
+1. Download the latest APK from [Releases](https://github.com/chanandlerrrbonng/UFlash/blob/main/UFlash.apk)
 2. Enable installation from unknown sources on your Android device (Settings > Security > Unknown Sources)
 3. Open the APK file on your device and tap **Install**
 
