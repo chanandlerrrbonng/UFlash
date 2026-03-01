@@ -3,6 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- ── Permissions ── -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Camera: required for RX image analysis + preview -->
     <uses-permission android:name="android.permission.CAMERA" />

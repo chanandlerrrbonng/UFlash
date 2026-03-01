@@ -14,6 +14,7 @@ import android.os.Looper
 import android.util.Log
 import android.util.Range
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -119,6 +120,13 @@ class MainActivity : AppCompatActivity() {
     private var camReadyRunnable: Runnable? = null
     private var countdownRunnable: Runnable? = null
 
+    // ── Volume-button navigation ───────────────────────────────────
+    // cmdButtons mirrors QUICK_CMDS order so updateCmdSelection() can
+    // highlight by index without a lookup.
+    private val cmdButtons        = mutableListOf<Button>()
+    private var selectedCmdIndex  = 0          // which command is currently "armed"
+    private var volHoldRunnable: Runnable? = null  // fires TX after 1.5 s hold
+
     // ══════════════════════════════════════════════════════════════
     // LIFECYCLE
     // ══════════════════════════════════════════════════════════════
@@ -179,42 +187,57 @@ class MainActivity : AppCompatActivity() {
 
         // ── Quick Commands section ─────────────────────────────────
         // 9 preset diver commands in a 3×3 grid, color-coded by urgency.
-        // One tap fills etMsg with the single-char code AND fires TX
-        // immediately — the diver never needs to touch the keyboard.
+        // Touch: one tap fires TX immediately.
+        // Hands-free: VOL▲▼ cycles the highlighted command;
+        //             hold either volume button 1.5 s to transmit.
         // ──────────────────────────────────────────────────────────
         layoutTx.addView(
             tv("⚡ Quick Commands  ·  one tap to send", 11f, "#607D8B"),
-            lp(bm = d(8))
+            lp(bm = d(6))
         )
 
+        cmdButtons.clear()
         for (rowStart in QUICK_CMDS.indices step 3) {
             val cmdRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             for (col in 0 until 3) {
                 val idx = rowStart + col
                 if (idx >= QUICK_CMDS.size) break
                 val (label, code, accent) = QUICK_CMDS[idx]
-                val bgHex = blendTowardDark(accent, 0.18f)   // dark tinted card
 
                 val cmdBtn = Button(this).apply {
                     text     = label
                     textSize = 12f
                     typeface = Typeface.DEFAULT_BOLD
                     setTextColor(c(accent))
-                    setBackgroundColor(c(bgHex))
+                    setBackgroundColor(c(blendTowardDark(accent, 0.18f)))  // dim default
                     setPadding(d(2), d(16), d(2), d(16))
                     setOnClickListener {
                         if (!isTransmitting.get()) {
-                            etMsg.setText(code)   // show the outgoing code
-                            startTx()             // transmit immediately
+                            selectedCmdIndex = idx
+                            updateCmdSelection()
+                            etMsg.setText(code)
+                            startTx()
                         }
                     }
                 }
+                cmdButtons.add(cmdBtn)
                 val p = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                     .also { it.marginEnd = if (col < 2) d(6) else 0 }
                 cmdRow.addView(cmdBtn, p)
             }
             layoutTx.addView(cmdRow, lp(bm = d(6)))
         }
+
+        // Highlight the default selection immediately
+        updateCmdSelection()
+
+        // Hands-free hint
+        layoutTx.addView(
+            tv("🔊  VOL▲▼ to navigate  ·  hold 1.5 s to send", 10f, "#455A64").also {
+                it.gravity = Gravity.CENTER
+            },
+            lp(bm = d(10))
+        )
 
         // Thin divider between quick-commands and custom message area
         layoutTx.addView(
@@ -318,6 +341,8 @@ class MainActivity : AppCompatActivity() {
         btnRx.setBackgroundColor(c("#37474F")); btnRx.setTextColor(c("#FFFFFF"))
         cancelReadyCountdown()
         closeCam()
+        // Ensure a command is always highlighted when entering TX mode
+        if (cmdButtons.isNotEmpty()) updateCmdSelection()
     }
 
     private fun showRxMode() {
@@ -337,6 +362,103 @@ class MainActivity : AppCompatActivity() {
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
             override fun surfaceDestroyed(h: SurfaceHolder) { closeCam() }
         })
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // VOLUME-BUTTON HANDS-FREE CONTROL
+    //
+    // The diver can operate quick commands without touching the screen:
+    //   Short press VOL▲ or VOL▼  →  cycle the highlighted command
+    //   (VOL▼ = forward / VOL▲ = backward through the grid)
+    //   Hold  VOL▲ or VOL▼ 1.5 s  →  transmit the highlighted command
+    //
+    // Haptic feedback:
+    //   1 short buzz   = selection changed
+    //   2 quick buzzes = transmission started
+    //
+    // Only active while in TX mode so RX volume control still works.
+    // ══════════════════════════════════════════════════════════════
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val code = event.keyCode
+        // Only intercept volume keys in TX mode
+        if (!isTxMode ||
+            (code != KeyEvent.KEYCODE_VOLUME_DOWN && code != KeyEvent.KEYCODE_VOLUME_UP)) {
+            return super.dispatchKeyEvent(event)
+        }
+
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                if (event.repeatCount == 0) {
+                    // Snapshot which command is armed at the moment the key goes down.
+                    // If the user holds, this is the command that will be sent.
+                    val armedCode = QUICK_CMDS[selectedCmdIndex].second
+
+                    volHoldRunnable = Runnable {
+                        volHoldRunnable = null   // mark as fired so ACTION_UP knows it was a hold
+                        if (!isTransmitting.get()) {
+                            etMsg.setText(armedCode)
+                            startTx()
+                            vibrateHold()        // double-buzz = "transmitting"
+                        }
+                    }
+                    mainHandler.postDelayed(volHoldRunnable!!, 1500L)
+                }
+            }
+            KeyEvent.ACTION_UP -> {
+                if (volHoldRunnable != null) {
+                    // Key released before 1.5 s → short press → cycle selection
+                    mainHandler.removeCallbacks(volHoldRunnable!!)
+                    volHoldRunnable = null
+                    val delta = if (code == KeyEvent.KEYCODE_VOLUME_DOWN) 1 else -1
+                    selectedCmdIndex = (selectedCmdIndex + delta + QUICK_CMDS.size) % QUICK_CMDS.size
+                    updateCmdSelection()
+                    vibrateShort()               // single short buzz = "moved to next"
+                }
+                // else: hold already fired — nothing to do
+            }
+        }
+        return true   // consume event; prevents system volume HUD from appearing
+    }
+
+    /**
+     * Visually highlight the currently selected quick-command button.
+     * Selected button gets a much brighter tinted background (60% blend)
+     * so it stands out clearly even in low-visibility conditions.
+     * All others drop back to the dim default (18% blend).
+     */
+    private fun updateCmdSelection() {
+        cmdButtons.forEachIndexed { idx, btn ->
+            val accent = QUICK_CMDS[idx].third
+            if (idx == selectedCmdIndex) {
+                btn.setBackgroundColor(c(blendTowardDark(accent, 0.65f)))  // bright = selected
+                btn.textSize = 12.5f
+            } else {
+                btn.setBackgroundColor(c(blendTowardDark(accent, 0.18f)))  // dim = idle
+                btn.textSize = 12f
+            }
+        }
+    }
+
+    /** Single short buzz — confirms a selection change. */
+    private fun vibrateShort() {
+        val vib = getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator ?: return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            vib.vibrate(android.os.VibrationEffect.createOneShot(40, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            @Suppress("DEPRECATION") vib.vibrate(40)
+        }
+    }
+
+    /** Double buzz — confirms that a transmission has started. */
+    private fun vibrateHold() {
+        val vib = getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator ?: return
+        val pattern = longArrayOf(0L, 70L, 60L, 70L)   // off, on, off, on
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            vib.vibrate(android.os.VibrationEffect.createWaveform(pattern, -1))
+        } else {
+            @Suppress("DEPRECATION") vib.vibrate(pattern, -1)
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
